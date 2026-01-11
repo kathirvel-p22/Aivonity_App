@@ -1,0 +1,51 @@
+name: aivonity_app
+description: "A new Flutter project."
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^2.4.0
+  dio: ^5.4.0
+  get_it: ^7.6.4
+  rxdart: ^0.27.7
+  json_annotation: ^4.8.1
+  firebase_core: ^2.24.2
+  firebase_messaging: ^14.7.10
+  flutter_local_notifications: ^18.0.1
+  geolocator: ^10.1.0
+  shared_preferences: ^2.2.2
+  http: ^1.1.2
+  google_maps_flutter: ^2.5.0
+  google_maps_flutter_web: ^0.5.4+2
+  google_maps_flutter_platform_interface: ^2.4.1
+  url_launcher: ^6.2.2
+  google_polyline_algorithm: ^3.1.0
+  fl_chart: ^0.68.0
+  intl: ^0.19.0
+  collection: ^1.18.0
+  pdf: ^3.10.7
+  printing: ^5.12.0
+  path_provider: ^2.1.2
+  excel: ^4.0.3
+  share_plus: ^7.2.2
+  sqflite: ^2.3.0
+  connectivity_plus: ^5.0.2
+  crypto: ^3.0.3
+  logger: ^2.0.2
+  audioplayers: ^6.0.0
+
+  path: any
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  build_runner: ^2.4.7
+  json_serializable: ^6.7.1
+  flutter_riverpod: any
+flutter:
+  uses-material-design: true

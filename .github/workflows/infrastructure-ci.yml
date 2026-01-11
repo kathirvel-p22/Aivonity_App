@@ -1,0 +1,294 @@
+name: Infrastructure CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "k8s/**"
+      - "docker-compose.yml"
+      - ".github/workflows/infrastructure-ci.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "k8s/**"
+      - "docker-compose.yml"
+      - ".github/workflows/infrastructure-ci.yml"
+
+jobs:
+  validate-kubernetes:
+    name: Validate Kubernetes Manifests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.28.0"
+
+      - name: Validate Kubernetes manifests
+        run: |
+          cd k8s
+          for file in *.yaml; do
+            echo "Validating $file..."
+            kubectl apply --dry-run=client -f "$file" || exit 1
+          done
+
+      - name: Lint Kubernetes manifests
+        uses: stackrox/kube-linter-action@v1
+        with:
+          directory: k8s/
+          format: sarif
+          output-file: kube-linter-results.sarif
+
+      - name: Upload Kube-linter results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: kube-linter-results.sarif
+
+  validate-docker-compose:
+    name: Validate Docker Compose
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose
+        run: |
+          docker-compose config --quiet
+
+      - name: Test Docker Compose build
+        run: |
+          docker-compose build --no-cache backend
+
+  security-scan-infrastructure:
+    name: Infrastructure Security Scanning
+    runs-on: ubuntu-latest
+    needs: [validate-kubernetes, validate-docker-compose]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov on Kubernetes manifests
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: k8s/
+          framework: kubernetes
+          output_format: sarif
+          output_file_path: checkov-k8s-results.sarif
+
+      - name: Run Checkov on Docker Compose
+        uses: bridgecrewio/checkov-action@master
+        with:
+          file: docker-compose.yml
+          framework: docker_compose
+          output_format: sarif
+          output_file_path: checkov-docker-results.sarif
+
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: |
+            checkov-k8s-results.sarif
+            checkov-docker-results.sarif
+
+  test-deployment:
+    name: Test Deployment
+    runs-on: ubuntu-latest
+    needs: [validate-kubernetes, validate-docker-compose]
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Kind (Kubernetes in Docker)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: aivonity-test
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            nodes:
+            - role: control-plane
+              kubeadmConfigPatches:
+              - |
+                kind: InitConfiguration
+                nodeRegistration:
+                  kubeletExtraArgs:
+                    node-labels: "ingress-ready=true"
+              extraPortMappings:
+              - containerPort: 80
+                hostPort: 80
+                protocol: TCP
+              - containerPort: 443
+                hostPort: 443
+                protocol: TCP
+
+      - name: Install NGINX Ingress Controller
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+          kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=90s
+
+      - name: Load Docker images into Kind
+        run: |
+          # Build and load backend image
+          docker build -t aivonity/backend:test ./backend
+          kind load docker-image aivonity/backend:test --name aivonity-test
+
+      - name: Deploy to test cluster
+        run: |
+          cd k8s
+
+          # Update image references for testing
+          sed -i 's|image: aivonity/backend:latest|image: aivonity/backend:test|g' backend-deployment.yaml
+
+          # Apply manifests
+          kubectl apply -f namespace.yaml
+          kubectl apply -f secrets.yaml
+          kubectl apply -f configmap.yaml
+          kubectl apply -f postgres-deployment.yaml
+          kubectl apply -f redis-deployment.yaml
+
+          # Wait for databases
+          kubectl wait --for=condition=available --timeout=300s deployment/postgres-deployment -n aivonity
+          kubectl wait --for=condition=available --timeout=300s deployment/redis-deployment -n aivonity
+
+          # Deploy backend
+          kubectl apply -f backend-deployment.yaml
+          kubectl apply -f nginx-deployment.yaml
+
+          # Wait for backend deployment
+          kubectl wait --for=condition=available --timeout=600s deployment/aivonity-backend-deployment -n aivonity
+          kubectl wait --for=condition=available --timeout=300s deployment/nginx-deployment -n aivonity
+
+      - name: Run smoke tests
+        run: |
+          # Port forward to access the service
+          kubectl port-forward service/nginx-service 8080:80 -n aivonity &
+          sleep 10
+
+          # Run basic health checks
+          curl -f http://localhost:8080/health || exit 1
+          echo "✅ Health check passed"
+
+          # Test API endpoints
+          curl -f http://localhost:8080/ || exit 1
+          echo "✅ Root endpoint accessible"
+
+      - name: Cleanup test cluster
+        run: |
+          kind delete cluster --name aivonity-test
+
+  deploy-infrastructure:
+    name: Deploy Infrastructure Changes
+    runs-on: ubuntu-latest
+    needs: [validate-kubernetes, security-scan-infrastructure]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.28.0"
+
+      - name: Configure kubectl for staging
+        if: github.ref == 'refs/heads/develop'
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > kubeconfig-staging
+          export KUBECONFIG=kubeconfig-staging
+
+      - name: Configure kubectl for production
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > kubeconfig-production
+          export KUBECONFIG=kubeconfig-production
+
+      - name: Apply infrastructure changes (Staging)
+        if: github.ref == 'refs/heads/develop'
+        run: |
+          export KUBECONFIG=kubeconfig-staging
+          cd k8s
+
+          # Apply non-disruptive changes first
+          kubectl apply -f namespace.yaml
+          kubectl apply -f configmap.yaml
+          kubectl apply -f secrets.yaml
+
+          # Apply service changes
+          kubectl apply -f postgres-deployment.yaml
+          kubectl apply -f redis-deployment.yaml
+          kubectl apply -f nginx-deployment.yaml
+          kubectl apply -f ingress.yaml
+          kubectl apply -f hpa.yaml
+          kubectl apply -f monitoring.yaml
+
+          echo "✅ Infrastructure changes applied to staging"
+
+      - name: Apply infrastructure changes (Production)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          export KUBECONFIG=kubeconfig-production
+          cd k8s
+
+          # Apply non-disruptive changes first
+          kubectl apply -f namespace.yaml
+          kubectl apply -f configmap.yaml
+          kubectl apply -f secrets.yaml
+
+          # Apply service changes
+          kubectl apply -f postgres-deployment.yaml
+          kubectl apply -f redis-deployment.yaml
+          kubectl apply -f nginx-deployment.yaml
+          kubectl apply -f ingress.yaml
+          kubectl apply -f hpa.yaml
+          kubectl apply -f monitoring.yaml
+
+          echo "✅ Infrastructure changes applied to production"
+
+      - name: Verify deployment
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+            export KUBECONFIG=kubeconfig-staging
+          else
+            export KUBECONFIG=kubeconfig-production
+          fi
+
+          # Check all deployments are ready
+          kubectl get deployments -n aivonity
+          kubectl get services -n aivonity
+          kubectl get pods -n aivonity
+
+  notify-infrastructure:
+    name: Notify Infrastructure Changes
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    if: always()
+
+    steps:
+      - name: Notify success
+        uses: 8398a7/action-slack@v3
+        with:
+          status: "success"
+          channel: "#infrastructure"
+          text: "AIVONITY Infrastructure changes deployed successfully! 🏗️"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: needs.deploy-infrastructure.result == 'success'
+
+      - name: Notify failure
+        uses: 8398a7/action-slack@v3
+        with:
+          status: "failure"
+          channel: "#infrastructure"
+          text: "AIVONITY Infrastructure deployment failed! ⚠️"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: needs.deploy-infrastructure.result == 'failure'

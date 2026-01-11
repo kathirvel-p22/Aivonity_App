@@ -1,0 +1,318 @@
+name: Security Scanning
+
+on:
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: "0 2 * * *"
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  codeql-analysis:
+    name: CodeQL Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ["python", "javascript"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:${{matrix.language}}"
+
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          cd backend
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Safety check (Python)
+        run: |
+          cd backend
+          pip install safety
+          safety check --json --output safety-report.json || true
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.16.0"
+          channel: "stable"
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Run Flutter dependency audit
+        run: |
+          flutter pub deps --json > flutter-dependencies.json
+          # Check for known vulnerabilities in Flutter dependencies
+          dart pub global activate pana
+          dart pub global run pana --json --no-warning > flutter-pana-report.json || true
+
+      - name: Upload dependency reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-reports
+          path: |
+            backend/safety-report.json
+            flutter-dependencies.json
+            flutter-pana-report.json
+
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          cd backend
+          docker build -t aivonity/backend:security-scan .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "aivonity/backend:security-scan"
+          format: "sarif"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Run Snyk container scan
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: "aivonity/backend:security-scan"
+          args: --severity-threshold=high --file=backend/Dockerfile
+
+  infrastructure-scan:
+    name: Infrastructure Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov on Kubernetes manifests
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: k8s/
+          framework: kubernetes
+          output_format: sarif
+          output_file_path: checkov-k8s-results.sarif
+          soft_fail: true
+
+      - name: Run Checkov on Docker Compose
+        uses: bridgecrewio/checkov-action@master
+        with:
+          file: docker-compose.yml
+          framework: docker_compose
+          output_format: sarif
+          output_file_path: checkov-docker-results.sarif
+          soft_fail: true
+
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: |
+            checkov-k8s-results.sarif
+            checkov-docker-results.sarif
+
+      - name: Run Kube-linter
+        uses: stackrox/kube-linter-action@v1
+        with:
+          directory: k8s/
+          format: sarif
+          output-file: kube-linter-results.sarif
+
+      - name: Upload Kube-linter results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: kube-linter-results.sarif
+
+  compliance-check:
+    name: Compliance and Policy Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run OPA Conftest for Kubernetes policies
+        run: |
+          # Install Conftest
+          wget https://github.com/open-policy-agent/conftest/releases/download/v0.46.0/conftest_0.46.0_Linux_x86_64.tar.gz
+          tar xzf conftest_0.46.0_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin
+
+          # Create basic security policies
+          mkdir -p policies
+          cat > policies/security.rego << 'EOF'
+          package main
+
+          deny[msg] {
+            input.kind == "Deployment"
+            input.spec.template.spec.containers[_].securityContext.runAsRoot == true
+            msg := "Container should not run as root"
+          }
+
+          deny[msg] {
+            input.kind == "Deployment"
+            not input.spec.template.spec.containers[_].resources.limits
+            msg := "Container should have resource limits"
+          }
+
+          deny[msg] {
+            input.kind == "Deployment"
+            input.spec.template.spec.containers[_].image
+            contains(input.spec.template.spec.containers[_].image, ":latest")
+            msg := "Container should not use 'latest' tag"
+          }
+          EOF
+
+          # Run policy checks
+          cd k8s
+          for file in *.yaml; do
+            echo "Checking policies for $file..."
+            conftest test --policy ../policies "$file" || true
+          done
+
+  security-report:
+    name: Generate Security Report
+    runs-on: ubuntu-latest
+    needs:
+      [
+        codeql-analysis,
+        dependency-scan,
+        secret-scan,
+        container-scan,
+        infrastructure-scan,
+        compliance-check,
+      ]
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Generate security summary
+        run: |
+          echo "# AIVONITY Security Scan Summary" > security-summary.md
+          echo "Generated on: $(date)" >> security-summary.md
+          echo "" >> security-summary.md
+
+          echo "## Scan Results" >> security-summary.md
+          echo "- CodeQL Analysis: ${{ needs.codeql-analysis.result }}" >> security-summary.md
+          echo "- Dependency Scan: ${{ needs.dependency-scan.result }}" >> security-summary.md
+          echo "- Secret Scan: ${{ needs.secret-scan.result }}" >> security-summary.md
+          echo "- Container Scan: ${{ needs.container-scan.result }}" >> security-summary.md
+          echo "- Infrastructure Scan: ${{ needs.infrastructure-scan.result }}" >> security-summary.md
+          echo "- Compliance Check: ${{ needs.compliance-check.result }}" >> security-summary.md
+
+          echo "" >> security-summary.md
+          echo "## Recommendations" >> security-summary.md
+          echo "- Review all high and critical severity findings" >> security-summary.md
+          echo "- Update dependencies with known vulnerabilities" >> security-summary.md
+          echo "- Ensure all secrets are properly managed" >> security-summary.md
+          echo "- Follow security best practices for container images" >> security-summary.md
+          echo "- Implement security policies for Kubernetes deployments" >> security-summary.md
+
+      - name: Upload security summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-summary
+          path: security-summary.md
+
+      - name: Notify security team
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          channel: "#security"
+          custom_payload: |
+            {
+              text: "AIVONITY Security Scan Completed",
+              attachments: [{
+                color: "${{ contains(needs.*.result, 'failure') && 'danger' || 'good' }}",
+                fields: [{
+                  title: "CodeQL Analysis",
+                  value: "${{ needs.codeql-analysis.result }}",
+                  short: true
+                }, {
+                  title: "Dependency Scan",
+                  value: "${{ needs.dependency-scan.result }}",
+                  short: true
+                }, {
+                  title: "Secret Scan",
+                  value: "${{ needs.secret-scan.result }}",
+                  short: true
+                }, {
+                  title: "Container Scan",
+                  value: "${{ needs.container-scan.result }}",
+                  short: true
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'

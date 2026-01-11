@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aivonity
+  labels:
+    name: aivonity
+    app: aivonity-vehicle-assistant

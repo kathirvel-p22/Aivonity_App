@@ -1,0 +1,276 @@
+name: Mobile CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "lib/**"
+      - "mobile/**"
+      - "pubspec.yaml"
+      - "android/**"
+      - "ios/**"
+      - ".github/workflows/mobile-ci.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "lib/**"
+      - "mobile/**"
+      - "pubspec.yaml"
+      - "android/**"
+      - "ios/**"
+      - ".github/workflows/mobile-ci.yml"
+
+jobs:
+  test:
+    name: Run Flutter Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.16.0"
+          channel: "stable"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Verify formatting
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze project source
+        run: flutter analyze --fatal-infos
+
+      - name: Run unit tests
+        run: flutter test --coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: mobile
+          name: mobile-coverage
+
+      - name: Run integration tests
+        run: flutter test integration_test/
+        if: github.event_name == 'push'
+
+  build-android:
+    name: Build Android APK/AAB
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.16.0"
+          channel: "stable"
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Configure Keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > android/app/keystore.jks
+          echo "storeFile=keystore.jks" >> android/key.properties
+          echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" >> android/key.properties
+          echo "storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}" >> android/key.properties
+          echo "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}" >> android/key.properties
+
+      - name: Build APK (Debug)
+        run: flutter build apk --debug
+        if: github.event_name == 'pull_request'
+
+      - name: Build APK (Release)
+        run: flutter build apk --release
+        if: github.event_name == 'push'
+
+      - name: Build AAB (Release)
+        run: flutter build appbundle --release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: android-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+        if: github.event_name == 'push'
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: android-aab
+          path: build/app/outputs/bundle/release/app-release.aab
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+  build-ios:
+    name: Build iOS IPA
+    runs-on: macos-latest
+    needs: test
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.16.0"
+          channel: "stable"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install
+
+      - name: Configure iOS signing
+        run: |
+          echo "${{ secrets.IOS_CERTIFICATE }}" | base64 -d > ios_certificate.p12
+          echo "${{ secrets.IOS_PROVISIONING_PROFILE }}" | base64 -d > ios_profile.mobileprovision
+
+          # Import certificate
+          security create-keychain -p "" build.keychain
+          security import ios_certificate.p12 -t agg -k ~/Library/Keychains/build.keychain -P "${{ secrets.IOS_CERTIFICATE_PASSWORD }}" -A
+          security list-keychains -s ~/Library/Keychains/build.keychain
+          security default-keychain -s ~/Library/Keychains/build.keychain
+          security unlock-keychain -p "" ~/Library/Keychains/build.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" ~/Library/Keychains/build.keychain
+
+          # Install provisioning profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp ios_profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      - name: Build iOS (Release)
+        run: |
+          flutter build ios --release --no-codesign
+          cd ios
+          xcodebuild -workspace Runner.xcworkspace -scheme Runner -configuration Release -destination generic/platform=iOS -archivePath build/Runner.xcarchive archive
+          xcodebuild -exportArchive -archivePath build/Runner.xcarchive -exportPath build/Runner.ipa -exportOptionsPlist ExportOptions.plist
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ios-ipa
+          path: ios/build/Runner.ipa/Runner.ipa
+
+  security-scan-mobile:
+    name: Mobile Security Scanning
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.16.0"
+          channel: "stable"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Run dependency audit
+        run: |
+          flutter pub deps --json > dependencies.json
+          # Check for known vulnerabilities in dependencies
+          dart pub global activate pana
+          dart pub global run pana --json --no-warning > pana-report.json || true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: mobile-security-reports
+          path: |
+            dependencies.json
+            pana-report.json
+
+  deploy-android:
+    name: Deploy Android to Play Store
+    runs-on: ubuntu-latest
+    needs: [build-android, security-scan-mobile]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download AAB artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: android-aab
+
+      - name: Deploy to Play Store (Internal Testing)
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+          packageName: com.aivonity.app
+          releaseFiles: app-release.aab
+          track: internal
+          status: completed
+
+  deploy-ios:
+    name: Deploy iOS to TestFlight
+    runs-on: macos-latest
+    needs: [build-ios, security-scan-mobile]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ios-ipa
+
+      - name: Deploy to TestFlight
+        run: |
+          xcrun altool --upload-app --type ios --file Runner.ipa --username "${{ secrets.APPLE_ID_EMAIL }}" --password "${{ secrets.APPLE_ID_PASSWORD }}" --verbose
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-android, deploy-ios]
+    if: always()
+
+    steps:
+      - name: Notify success
+        uses: 8398a7/action-slack@v3
+        with:
+          status: "success"
+          channel: "#deployments"
+          text: "AIVONITY Mobile apps deployed successfully! 📱"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: needs.deploy-android.result == 'success' && needs.deploy-ios.result == 'success'
+
+      - name: Notify failure
+        uses: 8398a7/action-slack@v3
+        with:
+          status: "failure"
+          channel: "#deployments"
+          text: "AIVONITY Mobile app deployment failed! ❌"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: needs.deploy-android.result == 'failure' || needs.deploy-ios.result == 'failure'

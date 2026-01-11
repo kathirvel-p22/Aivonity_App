@@ -1,0 +1,34 @@
+# AIVONITY Code Owners
+
+# Global owners
+* @aivonity-team
+
+# Backend code
+/backend/ @aivonity-backend-team @aivonity-team
+/backend/app/agents/ @aivonity-ai-team @aivonity-backend-team
+/backend/app/ml/ @aivonity-ai-team @aivonity-backend-team
+
+# Mobile code
+/lib/ @aivonity-mobile-team @aivonity-team
+/mobile/ @aivonity-mobile-team @aivonity-team
+/android/ @aivonity-mobile-team @aivonity-team
+/ios/ @aivonity-mobile-team @aivonity-team
+
+# Infrastructure
+/k8s/ @aivonity-devops-team @aivonity-team
+/docker-compose.yml @aivonity-devops-team @aivonity-team
+/.github/workflows/ @aivonity-devops-team @aivonity-team
+
+# Documentation
+/README.md @aivonity-team
+/docs/ @aivonity-team
+*.md @aivonity-team
+
+# Configuration files
+/.github/ @aivonity-devops-team @aivonity-team
+/pubspec.yaml @aivonity-mobile-team @aivonity-team
+/backend/requirements.txt @aivonity-backend-team @aivonity-team
+
+# Security-sensitive files
+/.github/workflows/security-scan.yml @aivonity-security-team @aivonity-devops-team
+/k8s/secrets.yaml @aivonity-security-team @aivonity-devops-team
