@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'service_centers_service.dart';
+import 'dart:developer' as developer;
 
 /// Booking Service
 /// Manages service bookings with local storage
@@ -22,7 +23,7 @@ class BookingService {
       await prefs.setString(_bookingsKey, jsonEncode(bookingsJson));
       return true;
     } catch (e) {
-      print('Error saving booking: $e');
+      developer.log('Error saving booking: $e', name: 'BookingService');
       return false;
     }
   }
@@ -36,9 +37,11 @@ class BookingService {
       if (bookingsJson == null) return [];
 
       final bookingsData = jsonDecode(bookingsJson) as List;
-      return bookingsData.map((data) => ServiceBooking.fromJson(data)).toList();
+      return bookingsData
+          .map((data) => ServiceBooking.fromJson(data as Map<String, dynamic>))
+          .toList();
     } catch (e) {
-      print('Error loading bookings: $e');
+      developer.log('Error loading bookings: $e', name: 'BookingService');
       return [];
     }
   }
@@ -94,7 +97,7 @@ class BookingService {
       await prefs.setString(_bookingsKey, jsonEncode(bookingsJson));
       return true;
     } catch (e) {
-      print('Error updating booking status: $e');
+      developer.log('Error updating booking status: $e', name: 'BookingService');
       return false;
     }
   }
@@ -107,7 +110,11 @@ class BookingService {
   /// Get booking by ID
   Future<ServiceBooking?> getBookingById(String bookingId) async {
     final bookings = await getAllBookings();
-    return bookings.firstWhere((booking) => booking.id == bookingId);
+    try {
+      return bookings.firstWhere((booking) => booking.id == bookingId);
+    } catch (e) {
+      return null;
+    }
   }
 }
 
@@ -199,32 +206,40 @@ class ServiceBooking {
   /// Create from JSON
   factory ServiceBooking.fromJson(Map<String, dynamic> json) {
     final serviceCentersService = ServiceCentersService();
-    final serviceCenter = serviceCentersService.getAllServiceCenters()
-        .firstWhere((center) => center.id == json['serviceCenter']);
+    final serviceCenterId = json['serviceCenter'] as String;
+    final allCenters = serviceCentersService.getAllServiceCenters();
+    final serviceCenter = allCenters.firstWhere(
+      (center) => center.id == serviceCenterId,
+      orElse: () => allCenters.first,
+    );
+
+    final timeData = json['time'] as Map<String, dynamic>;
 
     return ServiceBooking(
-      id: json['id'],
-      serviceType: json['serviceType'],
+      id: json['id'] as String,
+      serviceType: json['serviceType'] as String,
       serviceCenter: serviceCenter,
-      date: DateTime.parse(json['date']),
+      date: DateTime.parse(json['date'] as String),
       time: TimeOfDay(
-        hour: json['time']['hour'],
-        minute: json['time']['minute'],
+        hour: timeData['hour'] as int,
+        minute: timeData['minute'] as int,
       ),
-      additionalNotes: json['additionalNotes'],
+      additionalNotes: json['additionalNotes'] as String?,
       status: BookingStatus.values.firstWhere(
         (status) => status.name == json['status'],
         orElse: () => BookingStatus.confirmed,
       ),
-      createdAt: DateTime.parse(json['createdAt']),
-      bookingReference: json['bookingReference'],
+      createdAt: DateTime.parse(json['createdAt'] as String),
+      bookingReference: json['bookingReference'] as String?,
     );
   }
 
   /// Get formatted date and time
-  String getFormattedDateTime() {
+  String getFormattedDateTime(BuildContext? context) {
     final dateStr = '${date.day}/${date.month}/${date.year}';
-    final timeStr = time.format(const null); // Will use default locale
+    final hour = time.hourOfPeriod == 0 ? 12 : time.hourOfPeriod;
+    final period = time.period == DayPeriod.am ? 'AM' : 'PM';
+    final timeStr = '$hour:${time.minute.toString().padLeft(2, '0')} $period';
     return '$dateStr at $timeStr';
   }
 
